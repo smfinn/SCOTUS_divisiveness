@@ -1,0 +1,499 @@
+---
+title: "STAT 410 Final Project Analysis"
+author: "Sean Finn"
+date: "Due 4/29/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(dplyr)
+library(plyr)
+library(ggplot2)
+library(VGAM)
+library(gee)
+library(multgee)
+library(stringr)
+library(tidytext)
+library(questionr)
+library(geepack)
+library(cowplot)
+```
+
+# Final Project Analysis
+
+## 1. Load, clean, and recode data
+
+### Loading and cleaning steps
+```{r}
+#scotus <- read_csv("Desktop/STAT 410/Final project/archive-1/opinions_since_1970.csv")
+
+# Create text length variable and remove "mini-opinions" that are shorter than 3000 characters, per kaggle poster's cleaning advice
+#scotus$textlength <- nchar(scotus$text)
+#scotus <- scotus[which(nchar(scotus$textlength) < 3000),]
+
+scotus_notext <- read_csv("archive-1/opinions_since_1970.csv", 
+                          col_types = cols(text = col_skip()))
+scotus <- scotus_notext
+
+# Remove cases that don't have vote counts (n=441)
+scotus <- scotus[!is.na(scotus$scdb_decision_direction),]
+
+# Remove rows with authors that have fewer than 3 total opinions
+ct <- plyr::count(scotus$author_name)
+scotus$author_ct <- NA
+for (i in 1:length(unique(scotus$author_name))) {
+  scotus$temp <- (scotus$author_name==ct$x[i])
+  scotus$author_ct <- ifelse(scotus$temp==TRUE, sum(scotus$temp), scotus$author_ct)
+}
+scotus <- scotus[which(scotus$author_ct > 2),]
+
+# Remove Justice Douglas' opinions - reasons cited below
+scotus <- scotus[which(scotus$author_name != "Justice Douglas"),]
+```
+
+A note on dropping Justice Douglas:
+
+Despite the fact that me meets the minimum opinion count, we're going to drop Justice Douglas from the dataset. There are three core reasons:
+
+* He doesn't really belong to the era this report is examining. We are examining 1970-2016; Douglas was incapacitated in 1974 and retired in 1975.
+* The meta-statistics of his opinions are quite anomalous. He wrote far shorter opinions, far more opinions per year, and nearly exclusively in dissent.
+* The opinions he wrote were themselves highly unusual.
+
+The last point requires some substantiation, and is in fact a major understatement. Per Wikipedia:
+
+    "In general, legal scholars have noted that Douglas's judicial style was unusual in that he did not attempt to elaborate justifications for his judicial positions on the basis of text, history, or precedent. Douglas was known for writing short, pithy opinions which relied on philosophical insights, observations about current politics, and literature, as much as more conventional "judicial" sources. Douglas wrote many of his opinions in twenty minutes, often publishing the first draft."
+
+
+### Variable recodes
+``` {r}
+# View most common case party words
+scotus.parties <- data_frame(parties = scotus$case_name)
+parties <- scotus.parties %>% unnest_tokens(output = party, input = parties)
+parties <- as.data.frame(parties[parties!="v",]) # Remove the "v"s that separate party names
+party.counts <- parties %>% dplyr::count(party, sort = T)
+head(party.counts)
+
+# Separate out month variable
+scotus$month <- as.numeric(substring(scotus$date_filed, 6, 7))
+
+# Create party1 and party2 variables
+scotus$party1 <- substring(scotus$case_name, 1, 
+                           regexpr("\\s(v.)\\s", scotus$case_name) - 1)
+scotus$party2 <- substring(scotus$case_name, 
+                           regexpr("\\s(v.)\\s", scotus$case_name) + 4)
+
+# Create U.S. party indicator
+scotus$usparty <- ifelse(scotus$party1=="United States" | scotus$party2=="United States", 1, 0)
+sum(scotus$usparty)
+
+# Create indicator for corporate party - "Co.", "Inc.", or "Corp."
+scotus$corpparty <- ifelse(grepl("Co.",   scotus$case_name, fixed = TRUE), 1, 0)
+scotus$corpparty <- ifelse(grepl("Corp.", scotus$case_name, fixed = TRUE), 1, scotus$corpparty)
+scotus$corpparty <- ifelse(grepl("Inc.",  scotus$case_name, fixed = TRUE), 1, scotus$corpparty)
+sum(scotus$corpparty)
+
+# Create collapsed variable for category - combine types of dissenting opinions
+scotus$opiniontype <- as.factor(ifelse(scotus$category=="second_dissenting",  
+                                       "dissenting", as.character(scotus$category)))
+
+# Create new vote-related variables
+scotus$total_votes <- scotus$scdb_votes_majority + scotus$scdb_votes_minority
+scotus$unanimous_vote <- (scotus$scdb_votes_majority / scotus$total_votes) == 1
+scotus$close_vote <- (scotus$scdb_votes_majority / scotus$total_votes) < 0.6 &
+                     (scotus$scdb_votes_majority / scotus$total_votes) > 0.4
+
+# Create variable for number of opinions filed on same case
+opinions <- plyr::count(scotus$scdb_id)
+scotus$case_opinions_ct <- NA
+for (i in 1:length(unique(scotus$scdb_id))) {
+  scotus$case_opinions_ct <- ifelse(scotus$scdb_id==opinions$x[i], opinions$freq[i], scotus$case_opinions_ct)
+}
+
+# Create ordinal categorical variable for size of majority (0,1,3,5,7,9)
+scotus$vote_margin <- scotus$scdb_votes_majority - scotus$scdb_votes_minority
+scotus$vote_margin_cat <- as.factor(
+  ifelse(scotus$vote_margin %in% c(2,3), "2-3", 
+         ifelse(scotus$vote_margin %in% c(4,5), "4-5",
+                ifelse(scotus$vote_margin %in% c(6,7), "6-7", 
+                       ifelse(scotus$vote_margin %in% c(8,9), "8-9", 
+                              scotus$vote_margin)))))
+
+# How many tied votes? (n=47)
+sum(scotus$vote_margin==0)
+
+# Create indicator variable for whether dissenting opinion was filed
+scotus$dissenting_opinion <- ifelse(scotus$opiniontype == "dissenting", 1, 0)
+scotusnew <- aggregate(cbind(scotus$scdb_id, scotus$dissenting_opinion), 
+                       by=list(scotus$scdb_id), FUN = max, na.rm=FALSE)
+for (i in 1:length(unique(scotus$scdb_id))) {
+  scotus$dissenting_opinion <- ifelse(scotus$scdb_id==scotusnew$V1[i], 
+                                      scotusnew$V2[i], scotus$dissenting_opinion)
+}
+
+# Create subsetted data frame, collapsing over case ID - one row per case
+multivartestdata <- aggregate(scotus[,
+  c("year_filed", "scdb_decision_direction", "month", "usparty", "total_votes", 
+    "unanimous_vote", "close_vote", "case_opinions_ct", "vote_margin_cat", 
+    "dissenting_opinion", "corpparty")],
+  by = list(scotus$scdb_id), FUN = first)
+```
+
+
+
+
+## 2. Exploratory data analysis
+
+Outcome variables
+  * Unanimous outcome, binary
+  * Close vote outcome, binary
+  * Number of opinions on same case, ordinal categorical
+  * Size of majority, ordinal categorical
+  * Whether a dissenting opinion was filed in the case
+  
+#### EDA visualizations not used in report appendix
+```{r}
+questionr::freq(scotus$unanimous_vote, total = TRUE)
+questionr::freq(scotus$close_vote, total = TRUE)
+questionr::freq(scotus$usparty, total = TRUE)
+questionr::freq(scotus$corpparty, total = TRUE)
+
+hist1 <- ggplot(data=scotus, aes(vote_margin_cat)) +
+         geom_bar(aes(fill = vote_margin_cat)) + scale_fill_brewer() + 
+         theme_bw()
+hist1
+
+hist2 <- ggplot(data=scotus, aes(opiniontype)) +
+         geom_bar(aes(fill = opiniontype)) + scale_fill_brewer() + 
+         theme_bw()
+hist2
+
+hist3 <- ggplot(data=scotus, aes(author_name)) +
+         geom_bar(aes(fill = author_name)) + theme_bw()
+hist3
+
+hist5 <- ggplot(data=scotus, aes(month)) +
+         geom_bar(aes(fill = month)) + theme_bw()
+hist5
+
+hist6 <- ggplot(data=scotus, aes(scdb_votes_majority)) +
+         geom_bar(aes(fill = scdb_votes_majority)) + scale_fill_brewer() + 
+         theme_bw()
+hist6
+
+hist6 <- ggplot(data=scotus, aes(scdb_votes_minority)) +
+         geom_bar(aes(fill = scdb_votes_minority)) + scale_fill_brewer() + 
+         theme_bw()
+hist6
+
+hist7 <- ggplot(data=scotus, aes(total_votes)) +
+         geom_bar(aes(fill = total_votes)) + scale_fill_brewer() + 
+         theme_bw()
+hist7
+
+hist8 <- ggplot(data=scotus, aes(case_opinions_ct)) +
+         geom_bar(aes(fill = case_opinions_ct)) + scale_fill_brewer() + 
+         theme_bw()
+hist8
+
+plot1 <- ggplot(data = scotus, aes(usparty, fill=vote_margin_cat)) +
+         geom_bar(position = "dodge") +
+         theme_bw()
+plot1
+# Slight difference in distribution
+
+plot2 <- ggplot(data = multivartestdata, aes(year_filed, fill=vote_margin_cat)) +
+         geom_bar(position = "stack") +
+         theme_bw()
+plot2
+
+plot2.1 <- ggplot(data = multivartestdata, aes(year_filed, fill=vote_margin_cat)) +
+         geom_bar(position = "fill") +
+         theme_bw()
+plot2.1
+
+```
+
+#### EDA visualizations used in report appendix
+``` {r}
+# Include hist4 in appendix
+hist4 <- ggplot(data=scotus, aes(year_filed)) +
+         geom_bar(aes(fill = year_filed), fill = "coral3") + 
+         labs(title="Total SCOTUS opinions per year, 1970-2020", x="Year",
+              y="Total opinions") +
+         theme_bw()
+hist4
+
+# Include bar1 in appendix
+bar1 <- ggplot(data = scotus, aes(year_filed, as.numeric(unanimous_vote))) +
+        geom_bar(stat="identity", fill="darkorange2", width = 0.8) + 
+        labs(title="Number of unanimous SCOTUS votes per year", x = "Year", 
+             y = "Number of unanimous votes") +
+        theme_bw()
+bar1
+
+# Include bar2 in appendix
+bar2 <- ggplot(data = scotus, aes(year_filed, as.numeric(close_vote))) +
+        geom_bar(stat="identity", fill="goldenrod1", width = 0.8) + 
+        labs(title="Number of close SCOTUS votes per year", x = "Year", 
+             y = "Number of close votes") +
+        theme_bw()
+bar2
+
+# Include faceting of bar3 and bar3.1 in appendix
+bar3 <- ggplot(data = scotus, aes(year_filed)) +
+        geom_bar(aes(fill=opiniontype), width = 0.9, show.legend = F) + 
+        labs(title="SCOTUS opinion type distribution by year, 1970-2020", 
+             x = "Year", y = "Total number of opinions", fill = NULL) +
+        scale_fill_manual(values = c("lightgreen", "deepskyblue", "mediumorchid1", "plum")) +
+        theme_bw()
+bar3
+
+bar3.1 <- ggplot(data = scotus, aes(year_filed)) +
+        geom_bar(aes(fill=opiniontype), position = "fill", width = 1) + 
+        labs(title="SCOTUS opinion type distribution by year (normalized), 1970-2020", 
+             x = "Year", y = NULL, fill = "Opinion type") +
+        scale_fill_manual(values = c("lightgreen", "deepskyblue", "mediumorchid1", "plum")) +
+        theme_bw()
+bar3.1
+
+bar3comb <- plot_grid(bar3, bar3.1, ncol = 2)
+ggsave("Figure 4.png", bar3comb, width = 12, height = 5, units = "in")
+
+# Include faceting of bar4 and bar4.1 in appendix
+bar4 <- ggplot(data = scotus, aes(year_filed)) +
+        geom_bar(aes(fill=as.factor(case_opinions_ct)), width = 0.9, show.legend = F) + 
+        labs(title="Number of SCOTUS case opinions per year", x = "Year", 
+             y = "Number of case opinions", fill = NULL) +
+        scale_fill_manual(values = c("tomato", "darkorange", "orange", "gold")) +
+        theme_bw()
+bar4
+
+bar4.1 <- ggplot(data = scotus, aes(year_filed)) +
+        geom_bar(aes(fill=as.factor(case_opinions_ct)), position = "fill", width = 1) + 
+        labs(title="Number of SCOTUS case opinions per year (normalized)", x = "Year", 
+             y = NULL, fill = "Opinions filed per case") +
+        scale_fill_manual(values = c("tomato", "darkorange", "orange", "gold")) +
+        theme_bw()
+bar4.1
+
+bar4comb <- plot_grid(bar4, bar4.1, ncol = 2)
+ggsave("Figure 5.png", bar4comb, width = 12, height = 5, units = "in")
+
+# Include faceting of bar5 and bar5.1 in appendix
+bar5 <- ggplot(data = scotus, aes(year_filed, fill=vote_margin_cat)) +
+        geom_bar(position = "stack", width = 0.9, show.legend = F) + 
+        labs(title="SCOTUS vote margin distribution by year", x = "Year", 
+             y = "Vote margin distribution", fill = NULL) +
+        scale_fill_manual(values = c("tomato", "darkorange", "orange", "gold", "darkolivegreen3", "deepskyblue2")) +
+        theme_bw()
+bar5
+
+bar5.1 <- ggplot(data = scotus, aes(year_filed, fill=vote_margin_cat)) +
+        geom_bar(position = "fill", width = 1) + 
+        labs(title="SCOTUS vote margin distribution by year (normalized)", x = "Year", 
+             y = NULL, fill = "Vote margin") +
+        scale_fill_manual(values = c("tomato", "darkorange", "orange", "gold", "darkolivegreen3", "deepskyblue2")) +
+        theme_bw()
+bar5.1
+
+bar5comb <- plot_grid(bar5, bar5.1, ncol = 2)
+ggsave("Figure 6.png", bar5comb, width = 12, height = 5, units = "in")
+
+# Include hist9 in appendix
+hist9 <- ggplot(data=multivartestdata, aes(year_filed)) +
+         geom_bar(aes(fill = year_filed), fill = "mediumpurple") + 
+         labs(title="Total SCOTUS cases per year, 1970-2020", x="Year",
+              y="Total cases") +
+         theme_bw()
+hist9
+```
+
+## 3. Simple univariate regressions - logistic and cumulative logit 
+
+Simple models and hypothesis tests for possible outcome variables
+ - collapse dataset each time so that 1 row = 1 case
+ - in later analysis I will treat the multiple opinions per case as clusters
+ 
+```{r}
+# Outcome: Unanimous vote, binary
+datatest1 <- aggregate(cbind(scotus$year_filed, scotus$unanimous_vote),
+                       by = list(scotus$scdb_id), FUN = max, na.rm = FALSE)
+test1 <- glm(V2 ~ V1, data = datatest1, family = "binomial")
+summary(test1)
+# Odds of unanimous vote increase by year
+
+# Outcome: Close vote, binary
+datatest2 <- aggregate(cbind(scotus$year_filed, scotus$close_vote),
+                       by = list(scotus$scdb_id), FUN = max, na.rm = FALSE)
+test2 <- glm(V2 ~ V1, data = datatest2, family = "binomial")
+summary(test2)
+# Odds of close vote increase by year
+
+# Outcome: Whether a dissenting opinion was filed in the case, binary
+datatest3 <- aggregate(cbind(scotus$year_filed, scotus$dissenting_opinion),
+                       by = list(scotus$scdb_id), FUN = max, na.rm = FALSE)
+test3 <- glm(as.numeric(V2) ~ as.numeric(V1), data = datatest3, family = "binomial")
+summary(test3)
+# Odds of dissenting opinion being filed has increased since 1970
+
+# Outcome: Number of opinions per case, ordinal categorical
+datatest4 <- aggregate(cbind(scotus$year_filed, scotus$case_opinions_ct),
+                       by = list(scotus$scdb_id), FUN = max, na.rm = FALSE)
+test4 <- vglm(V2 ~ V1, data = datatest4, family = cumulative(parallel=T))
+summary(test4)
+
+datatest4.1 <- aggregate(cbind(scotus$year_filed, scotus$case_opinions_ct),
+                       by = list(scotus$scdb_id), FUN = max, na.rm = FALSE)
+test4.1 <- vglm(V2 ~ V1, data = datatest4, family = cumulative(parallel=F))
+
+lrtest(test4, test4.1)
+# Number of opinions per case has declined since 1970
+
+# Outcome: Vote margin, ordinal categorical
+datatest5 <- aggregate(cbind(scotus$year_filed, scotus$vote_margin_cat),
+                       by = list(scotus$scdb_id), FUN = first)
+test5 <- vglm(V2 ~ V1, data = datatest5, family = cumulative(parallel=T))
+summary(test5)
+
+datatest5.1 <- aggregate(cbind(scotus$year_filed, scotus$vote_margin_cat),
+                       by = list(scotus$scdb_id), FUN = first)
+test5.1 <- vglm(V2 ~ V1, data = datatest5, family = cumulative(parallel=F))
+summary(test5.1)
+
+lrtest(test5, test5.1)
+# Size of majority has declined since 1970
+```
+
+
+## 4. Multivariate regressions - logistic and cumulative logit
+
+Add explanatory variables: decision direction, month, US party, corporate party, total votes
+
+```{r}
+# Outcome: Unanimous vote, binary
+multitest1 <- glm(unanimous_vote ~ year_filed + factor(scdb_decision_direction) +
+                   month + usparty + corpparty + total_votes, 
+                   data = multivartestdata, family = "binomial")
+summary(multitest1)
+# Odds of unanimous vote are higher in later years and when decision is liberal rather than conservative; odds lower when total votes number is higher
+
+# Outcome: Close vote, binary
+multitest2 <- glm(close_vote ~ year_filed + factor(scdb_decision_direction) +
+                   month + usparty + corpparty + total_votes, 
+                   data = multivartestdata, family = "binomial")
+summary(multitest2)
+# Odds of close vote are higher in later years, later months, when number of total votes is higher; odds of close vote are lower when decision is liberal compared to conservative and when US is case party
+
+# Outcome: Whether a dissenting opinion was filed in the case, binary
+multitest3 <- glm(as.numeric(dissenting_opinion) ~ year_filed + factor(scdb_decision_direction) +
+                  month + usparty + corpparty + total_votes, 
+                  data = multivartestdata, family = "binomial")
+summary(multitest3)
+# Odds of dissenting opinion being filed are higher when more justices are serving (total votes is higher), but lower when the decision is liberal as compared to conservative and when the decision is non-partisan compared to conservative
+
+# For CL proportional odds models, perform LR test vs CL models w/o proportional odds assumption
+
+# Outcome: Number of opinions per case, ordinal categorical
+multitest4 <- vglm(case_opinions_ct ~ year_filed + factor(scdb_decision_direction) +
+                   month + usparty + corpparty + total_votes, 
+                  data = multivartestdata, family = cumulative(parallel=T))
+summary(multitest4)
+
+multitest4.1 <- vglm(case_opinions_ct ~ year_filed + factor(scdb_decision_direction) +
+                    month + usparty + corpparty + total_votes, 
+                    data = multivartestdata, family = cumulative(parallel=F))
+summary(multitest4.1)
+
+lrtest(multitest4.1, multitest4)
+
+# Outcome: Size of majority, ordinal categorical
+scotus <- scotus[order(scotus$vote_margin_cat),]
+
+multitest5 <- vglm(vote_margin_cat ~ year_filed + factor(scdb_decision_direction) +
+                   month + usparty + corpparty + total_votes, 
+                   data = multivartestdata, family = cumulative(parallel=T))
+summary(multitest5)
+
+#multitest5.1 <- vglm(vote_margin_cat ~ year_filed + factor(scdb_decision_direction) + # takes a long time to run, with warnings
+#                   month + usparty + corpparty + total_votes, 
+#                   data = multivartestdata, family = cumulative(parallel=F))
+#summary(multitest5.1)
+
+lrtest(multitest5.1, multitest5)
+# PO model works for this
+```
+
+
+## 5. GEE models
+
+Use expanded dataset (1-4 opinions per case) with cases as clusters
+
+Final GEE model: Unanimous vote
+```{r}
+geefit1.1 <- geeglm(unanimous_vote ~ year_filed + factor(scdb_decision_direction) + 
+                    month + usparty + corpparty + total_votes + author_ct +
+                    opiniontype, id = as.factor(scdb_id), corstr = "exchangeable",
+                    data = scotus, family = binomial(link = "logit"))
+summary(geefit1.1)
+anova(geefit1.1)
+# Choosing correlation structure = exchangeable because of correlation between predictors
+
+# Dropping month and usparty from predictors
+geefit1.2 <- geeglm(unanimous_vote ~ year_filed + factor(scdb_decision_direction) + 
+                    corpparty + total_votes + author_ct +
+                    opiniontype, id = as.factor(scdb_id), corstr = "exchangeable",
+                    data = scotus, family = binomial)
+summary(geefit1.2)
+anova(geefit1.2)
+```
+
+Final GEE model: Close vote
+``` {r}
+geefit2.1 <- geeglm(close_vote ~ year_filed + factor(scdb_decision_direction) + 
+                    month + usparty + corpparty + total_votes + author_ct +
+                    opiniontype, id = as.factor(scdb_id), corstr = "exchangeable",
+                    data = scotus, family = binomial)
+summary(geefit2.1)
+anova(geefit2.1)
+```
+
+Final GEE model: Dissenting opinion
+``` {r}
+geefit3.1 <- geeglm(as.numeric(dissenting_opinion) ~ year_filed + factor(scdb_decision_direction) + 
+                   month + usparty + corpparty + total_votes + author_ct +
+                   opiniontype, id = as.factor(scdb_id), corstr = "exchangeable",
+                   data = scotus, family = binomial)
+summary(geefit3.1)
+anova(geefit3.1)
+
+# Removing month and US party
+geefit3.2 <- geeglm(as.numeric(dissenting_opinion) ~ year_filed +  corpparty + 
+                   factor(scdb_decision_direction) + total_votes + author_ct +
+                   opiniontype, id = as.factor(scdb_id), corstr = "exchangeable",
+                   data = scotus, family = binomial)
+summary(geefit3.2)
+anova(geefit3.2)
+```
+
+Final GEE model: Number of case opinions
+``` {r}
+geefit4.1 <- ordLORgee(case_opinions_ct ~ year_filed + factor(scdb_decision_direction) + 
+                 month + usparty + corpparty + total_votes + author_ct +
+                 opiniontype, id = as.factor(scdb_id), LORstr = "independence", 
+                 data = scotus)
+summary(geefit4.1)
+```
+
+Final GEE model: Vote margin
+``` {r}
+geefit5.1 <- ordLORgee(ordered(vote_margin_cat) ~ year_filed + factor(scdb_decision_direction) + 
+                       month + usparty + corpparty + total_votes + author_ct +
+                       opiniontype, id = as.factor(scdb_id), LORstr = "independence", 
+                       data = scotus)
+summary(geefit5.1)
+```
+
+
+
